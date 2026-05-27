@@ -179,18 +179,32 @@ def build_table() -> Table:
 
 
 # ────────────────────────────────────────────────────────────
-# 화면 그리기
+# 패널 빌더
 # ────────────────────────────────────────────────────────────
-def print_screen(quality_label: str) -> None:
-    """상태 테이블 패널을 출력한다 (화면 지우기 포함)."""
-    console.clear()
+def build_panel(quality_label: str, mode: str = "queue") -> Panel:
+    """매 호출마다 새 Panel 을 생성해 반환한다.
 
+    mode='queue'       : Queue 모드 힌트
+    mode='downloading' : Download 모드 힌트
+    """
     with lock:
-        done   = sum(1 for d in downloads if d.status == Status.DONE)
-        active = sum(1 for d in downloads if d.status in ACTIVE_STATUSES)
-        errors = sum(1 for d in downloads if d.status == Status.ERROR)
+        done    = sum(1 for d in downloads if d.status == Status.DONE)
+        active  = sum(1 for d in downloads if d.status in ACTIVE_STATUSES)
+        pending = sum(1 for d in downloads if d.status == Status.PENDING)
+        errors  = sum(1 for d in downloads if d.status == Status.ERROR)
 
-    console.print(Panel(
+    if mode == "downloading":
+        hint = Text(
+            "  ⏳  다운로드 중…  완료되면 자동으로 입력창이 열립니다",
+            style="bold yellow",
+        )
+    else:
+        hint = Text(
+            "  URL+Enter 추가   │   /start 시작   │   /mod 음질   │   Ctrl+C 종료",
+            style="dim",
+        )
+
+    return Panel(
         Group(
             Align.center(Text("♪  YT Music Downloader", style="bold white on dark_red")),
             Text(""),
@@ -198,14 +212,21 @@ def print_screen(quality_label: str) -> None:
             Text(""),
             build_table(),
             Text(""),
-            Text(f"  완료: {done}   진행중: {active}   오류: {errors}",
-                 style="dim"),
+            Text(
+                f"  완료: {done}   진행중: {active}   대기: {pending}   오류: {errors}",
+                style="dim",
+            ),
+            Text(""),
+            hint,
         ),
         border_style="dark_red",
         padding=(0, 1),
-    ))
+    )
 
 
+# ────────────────────────────────────────────────────────────
+# URL 입력 박스
+# ────────────────────────────────────────────────────────────
 def print_url_box() -> None:
     """완전한 URL 입력 박스를 한 번에 그리고 커서를 입력 줄 안으로 이동시킨다."""
     w     = max(50, console.width - 1)   # 터미널 너비 - 1 (줄바꿈 방지)
@@ -221,7 +242,7 @@ def print_url_box() -> None:
     top_line    = top_prefix + "─" * top_dashes + "╮"
 
     # 힌트 줄: 한글 2바이트를 cell_len 으로 처리해 패딩 계산
-    hint     = "  붙여넣고 Enter   │   빈 Enter = 새로고침   │   Ctrl+C 종료"
+    hint     = "  URL+Enter 추가   │   /start 시작   │   /mod 음질   │   Ctrl+C 종료"
     hint_pad = max(0, inner - cell_len(hint) - 1)   # 1 = 우측 여백
 
     # ── 5줄 박스 ────────────────────────────────────────────
@@ -241,6 +262,15 @@ def print_url_box() -> None:
     # 5줄 + \n 후 커서는 줄 6 맨 앞 → 위로 2줄, 7번 열(1-indexed)
     sys.stdout.write("\033[2A\033[7G")
     sys.stdout.flush()
+
+
+# ────────────────────────────────────────────────────────────
+# 화면 그리기 (Queue 모드용)
+# ────────────────────────────────────────────────────────────
+def print_screen(quality_label: str) -> None:
+    """상태 패널을 출력한다 (화면 지우기 포함)."""
+    console.clear()
+    console.print(build_panel(quality_label, mode="queue"))
 
 
 # ────────────────────────────────────────────────────────────
@@ -365,49 +395,110 @@ def select_quality() -> tuple[str, str]:
 
 
 # ────────────────────────────────────────────────────────────
-# 완료 알림 스레드 (다운로드 완료 시 입력 프롬프트 아래에 한 줄 출력)
+# Queue 모드
 # ────────────────────────────────────────────────────────────
-def _done_notifier() -> None:
-    """완료된 항목이 생기면 즉시 터미널에 알림 한 줄을 출력한다."""
-    seen: set[int] = set()
+def queue_mode(quality_label: str, quality_arg: str) -> str:
+    """URL 입력 루프.
+
+    반환값:
+        'start' — PENDING 항목을 다운로드 시작해야 함
+        'mod'   — 음질 재선택 요청
+        'quit'  — 종료 요청
+    """
     while True:
-        time.sleep(0.4)
+        print_screen(quality_label)
+        print_url_box()
+
+        try:
+            line = sys.stdin.readline()
+        except KeyboardInterrupt:
+            return "quit"
+
+        if not line:          # EOF (Ctrl+D)
+            return "quit"
+
+        text = line.strip()
+
+        # 빈 Enter → 화면 새로고침만
+        if not text:
+            continue
+
+        # 커맨드
+        if text == "/start":
+            with lock:
+                has_pending = any(d.status == Status.PENDING for d in downloads)
+            if has_pending:
+                return "start"
+            # PENDING 없으면 무시
+            continue
+
+        if text == "/mod":
+            return "mod"
+
+        # URL 유효성
+        if not text.startswith(("http://", "https://")):
+            # 유효하지 않은 입력 무시
+            continue
+
+        # 중복 체크
         with lock:
-            items = list(downloads)
-        for item in items:
-            if item.status in (Status.DONE, Status.ERROR) and id(item) not in seen:
-                seen.add(id(item))
-                if item.status == Status.DONE:
-                    label  = f"✅  완료"
-                    title  = item.title[:52]
-                    suffix = f"  ({item.total_tracks}곡)" if item.is_playlist else ""
-                    sys.stdout.write(
-                        f"\n\033[1;32m  {label}:\033[0m  {title}{suffix}"
-                        f"\n\033[2m  (Enter 눌러 화면 새로고침)\033[0m\n"
-                    )
-                else:
-                    sys.stdout.write(
-                        f"\n\033[1;31m  ❌ 오류:\033[0m  {item.title[:52]}"
-                        f"  —  {item.error}"
-                        f"\n\033[2m  (Enter 눌러 화면 새로고침)\033[0m\n"
-                    )
-                sys.stdout.flush()
+            already = any(
+                d.url == text for d in downloads
+                if d.status not in {Status.DONE, Status.ERROR}
+            )
+        if already:
+            continue
+
+        # PENDING 상태로 목록에 추가 (다운로드 시작 안 함)
+        item = DownloadItem(url=text, quality_arg=quality_arg)
+        with lock:
+            downloads.append(item)
+        # 화면 새로고침 (continue → 루프 상단으로)
+        continue
 
 
 # ────────────────────────────────────────────────────────────
-# URL 입력 (단순 블로킹)
+# Download 모드
 # ────────────────────────────────────────────────────────────
-def wait_for_url(quality_label: str) -> str | None:
-    """화면을 그리고 URL 박스에서 한 줄 입력을 기다린다."""
-    print_screen(quality_label)
-    print_url_box()
-    try:
-        line = sys.stdin.readline()
-    except KeyboardInterrupt:
-        return None
-    if not line:          # EOF (Ctrl+D)
-        return None
-    return line.strip()
+def download_mode(quality_label: str, items_to_download: list[DownloadItem]) -> None:
+    """PENDING 항목들을 병렬 다운로드하고, 0.25s 주기로 화면 자동 갱신한다."""
+
+    # PENDING 항목마다 스레드 시작
+    for item in items_to_download:
+        threading.Thread(target=run_download, args=(item,), daemon=True).start()
+
+    # 자동 새로고침 루프 (입력 없음)
+    while True:
+        console.clear()
+        console.print(build_panel(quality_label, mode="downloading"))
+
+        with lock:
+            still_active = any(
+                d.status in ACTIVE_STATUSES or d.status == Status.PENDING
+                for d in items_to_download
+            )
+        if not still_active:
+            break
+
+        time.sleep(0.25)
+
+    # 완료 후 최종 화면 한 번 더
+    console.clear()
+    console.print(build_panel(quality_label, mode="downloading"))
+
+    # 완료 요약
+    with lock:
+        done_count  = sum(1 for d in items_to_download if d.status == Status.DONE)
+        error_count = sum(1 for d in items_to_download if d.status == Status.ERROR)
+
+    if error_count == 0:
+        console.print(f"\n  [bold green]✅  {done_count}개 모두 완료![/bold green]")
+    else:
+        console.print(
+            f"\n  [bold green]✅  완료: {done_count}개[/bold green]"
+            f"   [bold red]❌ 오류: {error_count}개[/bold red]"
+        )
+    time.sleep(1.5)
 
 
 # ────────────────────────────────────────────────────────────
@@ -416,46 +507,26 @@ def wait_for_url(quality_label: str) -> str | None:
 def main() -> None:
     quality_label, quality_arg = select_quality()
 
-    # 완료 알림 스레드 시작
-    threading.Thread(target=_done_notifier, daemon=True).start()
-
     while True:
-        url = wait_for_url(quality_label)
+        action = queue_mode(quality_label, quality_arg)
 
-        if url is None:
+        if action == "quit":
             console.print("\n[dim]종료합니다.[/]")
             sys.exit(0)
 
-        # 빈 Enter → 화면 새로고침
-        if not url:
+        if action == "mod":
+            quality_label, quality_arg = select_quality()
+            with lock:
+                for d in downloads:
+                    if d.status == Status.PENDING:
+                        d.quality_arg = quality_arg
             continue
 
-        # URL 유효성
-        if not url.startswith(("http://", "https://")):
-            console.print("  [red]✗  유효하지 않은 URL입니다.[/red]")
-            time.sleep(0.8)
-            continue
-
-        # 중복 체크
-        with lock:
-            already = any(
-                d.url == url for d in downloads
-                if d.status not in {Status.DONE, Status.ERROR}
-            )
-        if already:
-            console.print("  [yellow]⚠  이미 진행 중인 URL입니다.[/yellow]")
-            time.sleep(0.8)
-            continue
-
-        # 다운로드 등록
-        item = DownloadItem(url=url, quality_arg=quality_arg)
-        with lock:
-            downloads.append(item)
-
-        console.print("  [bold green]✓  다운로드 시작![/bold green]")
-        time.sleep(0.35)
-
-        threading.Thread(target=run_download, args=(item,), daemon=True).start()
+        if action == "start":
+            with lock:
+                pending = [d for d in downloads if d.status == Status.PENDING]
+            if pending:
+                download_mode(quality_label, pending)
 
 
 if __name__ == "__main__":
